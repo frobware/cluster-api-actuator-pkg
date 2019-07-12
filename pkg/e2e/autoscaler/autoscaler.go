@@ -32,6 +32,15 @@ const (
 	clusterAutoscalerScaleDownEmpty       = "ScaleDownEmpty"
 	clusterAutoscalerMaxNodesTotalReached = "MaxNodesTotalReached"
 	pollingInterval                       = 3 * time.Second
+	clusterKey                            = "machine.openshift.io/cluster-api-cluster"
+	machineSetKey                         = "machine.openshift.io/cluster-api-machineset"
+
+	// TODO(frobware) either share these from cluster-autoscaler, or cluster-api.
+	nodeGroupInstanceCPUCapacity    = "machine.openshift.io/instance-cpu-capacity"
+	nodeGroupInstanceGPUCapacity    = "machine.openshift.io/instance-gpu-capacity"
+	nodeGroupInstanceMemoryCapacity = "machine.openshift.io/instance-memory-capacity"
+	nodeGroupInstancePodCapacity    = "machine.openshift.io/instance-pod-capacity"
+	nodeGroupScaleFromZero          = "machine.openshift.io/scale-from-zero"
 )
 
 func newWorkLoad() *batchv1.Job {
@@ -201,6 +210,62 @@ func remaining(t time.Time) time.Duration {
 	return t.Sub(time.Now()).Round(time.Second)
 }
 
+func newMachineSet(
+	clusterName, namespace, name string,
+	selectorLabels map[string]string,
+	templateLabels map[string]string,
+	providerSpec *mapiv1beta1.ProviderSpec,
+) *mapiv1beta1.MachineSet {
+	ms := mapiv1beta1.MachineSet{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "MachineSet",
+			APIVersion: "machine.openshift.io/v1beta1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels: map[string]string{
+				clusterKey: clusterName,
+			},
+		},
+		Spec: mapiv1beta1.MachineSetSpec{
+			Selector: metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					clusterKey:    clusterName,
+					machineSetKey: name,
+				},
+			},
+			Template: mapiv1beta1.MachineTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						clusterKey:    clusterName,
+						machineSetKey: name,
+					},
+				},
+				Spec: mapiv1beta1.MachineSpec{
+					ProviderSpec: *providerSpec.DeepCopy(),
+				},
+			},
+			Replicas: pointer.Int32Ptr(0),
+		},
+	}
+
+	// Copy additional labels but do not overwrite those that
+	// already exist.
+	for k, v := range selectorLabels {
+		if _, exists := ms.Spec.Selector.MatchLabels[k]; !exists {
+			ms.Spec.Selector.MatchLabels[k] = v
+		}
+	}
+	for k, v := range templateLabels {
+		if _, exists := ms.Spec.Template.ObjectMeta.Labels[k]; !exists {
+			ms.Spec.Template.ObjectMeta.Labels[k] = v
+		}
+	}
+
+	return &ms
+}
+
 func dumpClusterAutoscalerLogs(client runtimeclient.Client, restClient *rest.RESTClient) {
 	pods := corev1.PodList{}
 	caLabels := map[string]string{
@@ -258,9 +323,9 @@ var _ = g.Describe("[Feature:Machines][Serial] Autoscaler should", func() {
 		}()
 
 		g.By("Getting machinesets")
-		machineSets, err := e2e.GetMachineSets(context.TODO(), client)
+		platformMachineSets, err := e2e.GetMachineSets(context.TODO(), client)
 		o.Expect(err).NotTo(o.HaveOccurred())
-		o.Expect(len(machineSets)).To(o.BeNumerically(">=", 2))
+		o.Expect(len(platformMachineSets)).To(o.BeNumerically(">=", 1))
 
 		g.By("Getting machines")
 		machines, err := e2e.GetMachines(context.TODO(), client)
@@ -271,6 +336,38 @@ var _ = g.Describe("[Feature:Machines][Serial] Autoscaler should", func() {
 		nodes, err := e2e.GetNodes(client)
 		o.Expect(err).NotTo(o.HaveOccurred())
 		o.Expect(len(nodes)).To(o.BeNumerically(">=", 1))
+
+		g.By("Deriving CPU and Memory capacity from a real node")
+		targetMachineSet := platformMachineSets[0]
+		workerNodes, err := e2e.GetWorkerNodes(client)
+		o.Expect(err).NotTo(o.HaveOccurred())
+		cpuCapacity := workerNodes[0].Status.Capacity[corev1.ResourceCPU]
+		memCapacity := workerNodes[0].Status.Capacity[corev1.ResourceMemory]
+		o.Expect(cpuCapacity).ShouldNot(o.BeNil())
+		o.Expect(cpuCapacity.String()).ShouldNot(o.BeEmpty())
+		o.Expect(memCapacity).ShouldNot(o.BeNil())
+		o.Expect(memCapacity.String()).ShouldNot(o.BeEmpty())
+
+		var machineSets [3]*mapiv1beta1.MachineSet
+		g.By(fmt.Sprintf("Creating %v MachineSets", len(machineSets)))
+		for i := 0; i < 3; i++ {
+			machineSets[i] = newMachineSet(targetMachineSet.Labels[clusterKey],
+				targetMachineSet.Namespace,
+				fmt.Sprintf("autoscaler-%d-%s", i, targetMachineSet.Name),
+				targetMachineSet.Spec.Selector.MatchLabels,
+				targetMachineSet.Spec.Template.ObjectMeta.Labels,
+				&targetMachineSet.Spec.Template.Spec.ProviderSpec)
+			machineSets[i].Annotations = map[string]string{
+				nodeGroupInstanceCPUCapacity:    cpuCapacity.String(),
+				nodeGroupInstanceMemoryCapacity: memCapacity.String(),
+				nodeGroupScaleFromZero:          "true",
+			}
+			machineSets[i].Spec.Template.Spec.ObjectMeta.Labels = map[string]string{
+				e2e.WorkerNodeRoleLabel: "",
+			}
+			o.Expect(client.Create(context.TODO(), machineSets[i])).Should(o.Succeed())
+			cleanupObjects = append(cleanupObjects, runtime.Object(machineSets[i]))
+		}
 
 		g.By(fmt.Sprintf("Creating %v machineautoscalers", len(machineSets)))
 		var clusterExpansionSize int
@@ -283,7 +380,7 @@ var _ = g.Describe("[Feature:Machines][Serial] Autoscaler should", func() {
 			clusterExpansionSize += 1
 
 			glog.Infof("Create MachineAutoscaler backed by MachineSet %s/%s - min:%v, max:%v", machineSets[i].Namespace, machineSets[i].Name, min, max)
-			asr := machineAutoscalerResource(&machineSets[i], min, max)
+			asr := machineAutoscalerResource(machineSets[i], min, max)
 			o.Expect(client.Create(context.TODO(), asr)).Should(o.Succeed())
 			cleanupObjects = append(cleanupObjects, runtime.Object(asr))
 		}
