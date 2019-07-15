@@ -14,6 +14,7 @@ import (
 	mapiv1beta1 "github.com/openshift/cluster-api/pkg/apis/machine/v1beta1"
 	caov1 "github.com/openshift/cluster-autoscaler-operator/pkg/apis/autoscaling/v1"
 	caov1beta1 "github.com/openshift/cluster-autoscaler-operator/pkg/apis/autoscaling/v1beta1"
+	kappsapi "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -43,7 +44,66 @@ const (
 	nodeGroupScaleFromZero          = "machine.openshift.io/scale-from-zero"
 )
 
-func newWorkLoad() *batchv1.Job {
+func newWorkLoad2(replicas int32) *kappsapi.Deployment {
+	return &kappsapi.Deployment{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Deployment",
+			APIVersion: "extensions/v1beta1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "scale-up-workload",
+			Namespace: "default",
+			Labels: map[string]string{
+				"app": "scale-up-workload",
+			},
+		},
+		Spec: kappsapi.DeploymentSpec{
+			Replicas: pointer.Int32Ptr(replicas),
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"app": "scale-up-workload",
+				},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"app": "scale-up-workload",
+					},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:  "workload",
+							Image: "busybox",
+							Command: []string{
+								"sleep",
+								"86400", // 1 day
+							},
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									"memory": resource.MustParse("500Mi"),
+									"cpu":    resource.MustParse("500m"),
+								},
+							},
+						},
+					},
+					// RestartPolicy: corev1.RestartPolicyNever,
+					NodeSelector: map[string]string{
+						e2e.WorkerNodeRoleLabel: "",
+					},
+					Tolerations: []corev1.Toleration{
+						{
+							Key:      "kubemark",
+							Operator: corev1.TolerationOpExists,
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func newWorkLoad(njobs int32, memoryCapacity resource.Quantity) *batchv1.Job {
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "workload",
@@ -67,7 +127,7 @@ func newWorkLoad() *batchv1.Job {
 							},
 							Resources: corev1.ResourceRequirements{
 								Requests: corev1.ResourceList{
-									"memory": resource.MustParse("500Mi"),
+									"memory": memoryCapacity,
 									"cpu":    resource.MustParse("500m"),
 								},
 							},
@@ -86,8 +146,8 @@ func newWorkLoad() *batchv1.Job {
 				},
 			},
 			BackoffLimit: pointer.Int32Ptr(4),
-			Completions:  pointer.Int32Ptr(100),
-			Parallelism:  pointer.Int32Ptr(100),
+			Completions:  pointer.Int32Ptr(njobs),
+			Parallelism:  pointer.Int32Ptr(njobs),
 		},
 	}
 }
@@ -290,7 +350,7 @@ func dumpClusterAutoscalerLogs(client runtimeclient.Client, restClient *rest.RES
 	}
 }
 
-var _ = g.Describe("[Feature:Machines][Serial] Autoscaler should", func() {
+var _ = g.Describe("FROBWARE[Feature:Machines][Serial] Autoscaler should", func() {
 	g.It("scale up and down", func() {
 		defer g.GinkgoRecover()
 
@@ -305,19 +365,23 @@ var _ = g.Describe("[Feature:Machines][Serial] Autoscaler should", func() {
 		restClient, err = e2e.LoadRestClient()
 		o.Expect(err).NotTo(o.HaveOccurred())
 
+		deleteObject := func(obj runtime.Object) error {
+			switch obj.(type) {
+			case *caov1.ClusterAutoscaler:
+				dumpClusterAutoscalerLogs(client, restClient)
+			}
+			return client.Delete(context.TODO(), obj, func(opt *runtimeclient.DeleteOptions) {
+				cascadeDelete := metav1.DeletePropagationForeground
+				opt.PropagationPolicy = &cascadeDelete
+			})
+		}
+
 		// Anything we create we must cleanup
 		var cleanupObjects []runtime.Object
 		defer func() {
-			cascadeDelete := metav1.DeletePropagationForeground
 			for _, obj := range cleanupObjects {
-				switch obj.(type) {
-				case *caov1.ClusterAutoscaler:
-					dumpClusterAutoscalerLogs(client, restClient)
-				}
-				if err = client.Delete(context.TODO(), obj, func(opt *runtimeclient.DeleteOptions) {
-					opt.PropagationPolicy = &cascadeDelete
-				}); err != nil {
-					glog.Errorf("error deleting object: %v", err)
+				if err := deleteObject(obj); err != nil {
+					glog.Errorf("[cleanup] error deleting object: %v", err)
 				}
 			}
 		}()
@@ -337,20 +401,29 @@ var _ = g.Describe("[Feature:Machines][Serial] Autoscaler should", func() {
 		o.Expect(err).NotTo(o.HaveOccurred())
 		o.Expect(len(nodes)).To(o.BeNumerically(">=", 1))
 
-		g.By("Deriving CPU and Memory capacity from a real node")
+		g.By(fmt.Sprintf("Deriving CPU and Memory capacity from machine %q", platformMachineSets[0].Name))
 		targetMachineSet := platformMachineSets[0]
 		workerNodes, err := e2e.GetWorkerNodes(client)
 		o.Expect(err).NotTo(o.HaveOccurred())
+		o.Expect(len(workerNodes)).To(o.BeNumerically(">=", 1))
 		cpuCapacity := workerNodes[0].Status.Capacity[corev1.ResourceCPU]
-		memCapacity := workerNodes[0].Status.Capacity[corev1.ResourceMemory]
 		o.Expect(cpuCapacity).ShouldNot(o.BeNil())
 		o.Expect(cpuCapacity.String()).ShouldNot(o.BeEmpty())
+		memCapacity := workerNodes[0].Status.Capacity[corev1.ResourceMemory]
 		o.Expect(memCapacity).ShouldNot(o.BeNil())
 		o.Expect(memCapacity.String()).ShouldNot(o.BeEmpty())
+		glog.Infof("CPU capacity: %q, Memory capacity: %s", cpuCapacity.String(), memCapacity.String())
 
+		// This test requires 3 machinesets
 		var machineSets [3]*mapiv1beta1.MachineSet
-		g.By(fmt.Sprintf("Creating %v MachineSets", len(machineSets)))
-		for i := 0; i < 3; i++ {
+
+		// reuse machinesets that already exist
+		for i := 0; i < len(platformMachineSets); i++ {
+			machineSets[i] = &platformMachineSets[i]
+		}
+
+		// create new machinesets
+		for i := len(platformMachineSets); i < len(machineSets); i++ {
 			machineSets[i] = newMachineSet(targetMachineSet.Labels[clusterKey],
 				targetMachineSet.Namespace,
 				fmt.Sprintf("autoscaler-%d-%s", i, targetMachineSet.Name),
@@ -370,21 +443,17 @@ var _ = g.Describe("[Feature:Machines][Serial] Autoscaler should", func() {
 		}
 
 		g.By(fmt.Sprintf("Creating %v machineautoscalers", len(machineSets)))
-		var clusterExpansionSize int
 		for i := range machineSets {
 			min := pointer.Int32PtrDerefOr(machineSets[i].Spec.Replicas, 1)
 			// We only want each machineautoscaler
 			// resource to be able to grow by one
 			// additional node.
 			max := min + 1
-			clusterExpansionSize += 1
-
 			glog.Infof("Create MachineAutoscaler backed by MachineSet %s/%s - min:%v, max:%v", machineSets[i].Namespace, machineSets[i].Name, min, max)
 			asr := machineAutoscalerResource(machineSets[i], min, max)
 			o.Expect(client.Create(context.TODO(), asr)).Should(o.Succeed())
 			cleanupObjects = append(cleanupObjects, runtime.Object(asr))
 		}
-		o.Expect(clusterExpansionSize).To(o.BeNumerically(">", 1))
 
 		// We want to scale out to max-cluster-size-1. We
 		// choose max-1 because we want to test that
@@ -392,7 +461,7 @@ var _ = g.Describe("[Feature:Machines][Serial] Autoscaler should", func() {
 		// cluster-autoscaler. If maxNodesTotal ==
 		// max-cluster-size then no MaxNodesTotalReached
 		// event will be generated.
-		maxNodesTotal := len(nodes) + clusterExpansionSize - 1
+		maxNodesTotal := len(nodes) + len(machineSets) - 1
 
 		eventWatcher := newEventWatcher(clientset)
 		o.Expect(eventWatcher.run()).Should(o.BeTrue())
@@ -405,7 +474,7 @@ var _ = g.Describe("[Feature:Machines][Serial] Autoscaler should", func() {
 			}
 		}).enable()
 
-		g.By(fmt.Sprintf("Creating ClusterAutoscaler configured with maxNodesTotal:%v", maxNodesTotal))
+		g.By(fmt.Sprintf("Creating ClusterAutoscaler configured with maxNodesTotal:%v. There are %v existing nodes", maxNodesTotal, len(nodes)))
 		clusterAutoscaler := clusterAutoscalerResource(maxNodesTotal)
 		o.Expect(client.Create(context.TODO(), clusterAutoscaler)).Should(o.Succeed())
 		cleanupObjects = append(cleanupObjects, runtime.Object(clusterAutoscaler))
@@ -417,22 +486,26 @@ var _ = g.Describe("[Feature:Machines][Serial] Autoscaler should", func() {
 		}
 		scaleUpCounter := newScaleUpCounter(eventWatcher, 0, scaledGroups)
 		maxNodesTotalReachedCounter := newMaxNodesTotalReachedCounter(eventWatcher, 0)
-		workload := newWorkLoad()
+
+		bytes, ok := memCapacity.AsInt64()
+		o.Expect(ok).Should(o.BeTrue())
+		// set job load to 70% of available memory per instance.
+		workload := newWorkLoad(int32(len(machineSets)), resource.MustParse(fmt.Sprintf("%v", bytes*70/100)))
 		o.Expect(client.Create(context.TODO(), workload)).Should(o.Succeed())
 		cleanupObjects = append(cleanupObjects, runtime.Object(workload))
 		testDuration := time.Now().Add(time.Duration(e2e.WaitLong))
 		o.Eventually(func() bool {
 			v := scaleUpCounter.get()
 			glog.Infof("[%s remaining] Expecting %v %q events; observed %v",
-				remaining(testDuration), clusterExpansionSize-1, clusterAutoscalerScaledUpGroup, v)
-			return v == uint32(clusterExpansionSize-1)
+				remaining(testDuration), len(machineSets)-1, clusterAutoscalerScaledUpGroup, v)
+			return v == uint32(len(machineSets)-1)
 		}, e2e.WaitLong, pollingInterval).Should(o.BeTrue())
 
 		// The cluster-autoscaler can keep on generating
 		// ScaledUpGroup events but in this scenario we are
 		// expecting no more as we explicitly capped the
 		// cluster size with maxNodesTotal (i.e.,
-		// clusterExpansionSize -1). We run for a period of
+		// len(machineSets) -1). We run for a period of
 		// time asserting that the cluster does not exceed the
 		// capped size.
 		testDuration = time.Now().Add(time.Duration(e2e.WaitShort))
@@ -441,19 +514,20 @@ var _ = g.Describe("[Feature:Machines][Serial] Autoscaler should", func() {
 			glog.Infof("[%s remaining] Waiting for %s to generate a %q event; observed %v",
 				remaining(testDuration), clusterAutoscalerComponent, clusterAutoscalerMaxNodesTotalReached, v)
 			return v
-		}, e2e.WaitShort, 3*time.Second).Should(o.BeNumerically(">=", 1))
+		}, e2e.WaitShort, pollingInterval).Should(o.BeNumerically(">=", 1))
 
-		testDuration = time.Now().Add(time.Duration(e2e.WaitShort))
-		o.Consistently(func() bool {
-			v := scaleUpCounter.get()
-			glog.Infof("[%s remaining] At max cluster size and expecting no more %q events; currently have %v, max=%v",
-				remaining(testDuration), clusterAutoscalerScaledUpGroup, v, clusterExpansionSize-1)
-			return v == uint32(clusterExpansionSize-1)
-		}, e2e.WaitShort, pollingInterval).Should(o.BeTrue())
+		// testDuration = time.Now().Add(time.Duration(e2e.WaitShort))
+		// o.Consistently(func() bool {
+		// 	v := scaleUpCounter.get()
+		// 	glog.Infof("[%s remaining] At max cluster size and expecting no more %q events; currently have %v, max=%v",
+		// 		remaining(testDuration), clusterAutoscalerScaledUpGroup, v, len(machineSets)-1)
+		// 	return v == uint32(len(machineSets)-1)
+		// }, e2e.WaitShort, pollingInterval).Should(o.BeTrue())
 
 		g.By("Deleting workload")
-		scaleDownCounter := newScaleDownCounter(eventWatcher, uint32(clusterExpansionSize-1))
+		scaleDownCounter := newScaleDownCounter(eventWatcher, uint32(len(machineSets)-1))
 		o.Expect(e2e.DeleteObjectsByLabels(context.TODO(), client, map[string]string{autoscalingTestLabel: ""}, &batchv1.JobList{})).Should(o.Succeed())
+		// o.Expect(client.Delete(context.TODO(), workload)).Should(o.Succeed())
 		if len(cleanupObjects) > 1 && cleanupObjects[len(cleanupObjects)-1] == workload {
 			cleanupObjects = cleanupObjects[:len(cleanupObjects)-1]
 		}
@@ -470,7 +544,7 @@ var _ = g.Describe("[Feature:Machines][Serial] Autoscaler should", func() {
 		o.Eventually(func() int {
 			currentNodes, err := e2e.GetNodes(client)
 			o.Expect(err).NotTo(o.HaveOccurred())
-			glog.Infof("[%s remaining] Waiting fo cluster to reach original node count of %v; currently have %v",
+			glog.Infof("[%s remaining] Waiting for cluster to reach original node count of %v; currently have %v",
 				remaining(testDuration), len(nodes), len(currentNodes))
 			return len(currentNodes)
 		}, e2e.WaitMedium, pollingInterval).Should(o.Equal(len(nodes)))
@@ -480,9 +554,10 @@ var _ = g.Describe("[Feature:Machines][Serial] Autoscaler should", func() {
 		o.Eventually(func() int {
 			currentMachines, err := e2e.GetMachines(context.TODO(), client)
 			o.Expect(err).NotTo(o.HaveOccurred())
-			glog.Infof("[%s remaining] Waiting fo cluster to reach original machine count of %v; currently have %v",
+			glog.Infof("[%s remaining] Waiting for cluster to reach original machine count of %v; currently have %v",
 				remaining(testDuration), len(machines), len(currentMachines))
 			return len(currentMachines)
 		}, e2e.WaitMedium, pollingInterval).Should(o.Equal(len(machines)))
+
 	})
 })
