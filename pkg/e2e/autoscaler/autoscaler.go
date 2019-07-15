@@ -103,7 +103,7 @@ func newWorkLoad2(replicas int32) *kappsapi.Deployment {
 	}
 }
 
-func newWorkLoad(njobs int32, memoryCapacity resource.Quantity) *batchv1.Job {
+func newWorkLoad(njobs int, memoryCapacity resource.Quantity) *batchv1.Job {
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "workload",
@@ -146,8 +146,8 @@ func newWorkLoad(njobs int32, memoryCapacity resource.Quantity) *batchv1.Job {
 				},
 			},
 			BackoffLimit: pointer.Int32Ptr(4),
-			Completions:  pointer.Int32Ptr(njobs),
-			Parallelism:  pointer.Int32Ptr(njobs),
+			Completions:  pointer.Int32Ptr(int32(njobs)),
+			Parallelism:  pointer.Int32Ptr(int32(njobs)),
 		},
 	}
 }
@@ -401,25 +401,38 @@ var _ = g.Describe("FROBWARE[Feature:Machines][Serial] Autoscaler should", func(
 		o.Expect(err).NotTo(o.HaveOccurred())
 		o.Expect(len(nodes)).To(o.BeNumerically(">=", 1))
 
+		glog.Infof("Have %v existing machinesets", len(platformMachineSets))
+		// existing machinesets must have a replicaCount >= 1
+		for i := 0; i < len(platformMachineSets); i++ {
+			replicas := pointer.Int32PtrDerefOr(platformMachineSets[i].Spec.Replicas, 0)
+			o.Expect(replicas).To(o.BeNumerically(">=", 1))
+		}
+
 		g.By(fmt.Sprintf("Deriving CPU and Memory capacity from machine %q", platformMachineSets[0].Name))
 		targetMachineSet := platformMachineSets[0]
 		workerNodes, err := e2e.GetWorkerNodes(client)
 		o.Expect(err).NotTo(o.HaveOccurred())
 		o.Expect(len(workerNodes)).To(o.BeNumerically(">=", 1))
+
 		cpuCapacity := workerNodes[0].Status.Capacity[corev1.ResourceCPU]
 		o.Expect(cpuCapacity).ShouldNot(o.BeNil())
 		o.Expect(cpuCapacity.String()).ShouldNot(o.BeEmpty())
+
 		memCapacity := workerNodes[0].Status.Capacity[corev1.ResourceMemory]
 		o.Expect(memCapacity).ShouldNot(o.BeNil())
 		o.Expect(memCapacity.String()).ShouldNot(o.BeEmpty())
 		glog.Infof("CPU capacity: %q, Memory capacity: %s", cpuCapacity.String(), memCapacity.String())
 
-		// This test requires 3 machinesets
+		// The remainder of the logic in this test requires 3
+		// machinesets.
 		var machineSets [3]*mapiv1beta1.MachineSet
 
 		// reuse machinesets that already exist
 		for i := 0; i < len(platformMachineSets); i++ {
-			machineSets[i] = &platformMachineSets[i]
+			if i == len(machineSets) {
+				break
+			}
+			machineSets[i] = platformMachineSets[i].DeepCopy()
 		}
 
 		// create new machinesets
@@ -487,10 +500,10 @@ var _ = g.Describe("FROBWARE[Feature:Machines][Serial] Autoscaler should", func(
 		scaleUpCounter := newScaleUpCounter(eventWatcher, 0, scaledGroups)
 		maxNodesTotalReachedCounter := newMaxNodesTotalReachedCounter(eventWatcher, 0)
 
-		bytes, ok := memCapacity.AsInt64()
+		memCapacityInBytes, ok := memCapacity.AsInt64()
 		o.Expect(ok).Should(o.BeTrue())
-		// set job load to 70% of available memory per instance.
-		workload := newWorkLoad(int32(len(machineSets)), resource.MustParse(fmt.Sprintf("%v", bytes*70/100)))
+		memBytes70Percent := resource.MustParse(fmt.Sprintf("%v", memCapacityInBytes*70/100))
+		workload := newWorkLoad(len(machineSets), memBytes70Percent)
 		o.Expect(client.Create(context.TODO(), workload)).Should(o.Succeed())
 		cleanupObjects = append(cleanupObjects, runtime.Object(workload))
 		testDuration := time.Now().Add(time.Duration(e2e.WaitLong))
@@ -558,6 +571,5 @@ var _ = g.Describe("FROBWARE[Feature:Machines][Serial] Autoscaler should", func(
 				remaining(testDuration), len(machines), len(currentMachines))
 			return len(currentMachines)
 		}, e2e.WaitMedium, pollingInterval).Should(o.Equal(len(machines)))
-
 	})
 })
