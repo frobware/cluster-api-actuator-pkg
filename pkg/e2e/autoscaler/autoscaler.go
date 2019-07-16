@@ -11,6 +11,7 @@ import (
 	g "github.com/onsi/ginkgo"
 	o "github.com/onsi/gomega"
 	e2e "github.com/openshift/cluster-api-actuator-pkg/pkg/e2e/framework"
+	"github.com/openshift/cluster-api-actuator-pkg/pkg/e2e/infra"
 	mapiv1beta1 "github.com/openshift/cluster-api/pkg/apis/machine/v1beta1"
 	caov1 "github.com/openshift/cluster-autoscaler-operator/pkg/apis/autoscaling/v1"
 	caov1beta1 "github.com/openshift/cluster-autoscaler-operator/pkg/apis/autoscaling/v1beta1"
@@ -275,6 +276,7 @@ func newMachineSet(
 	selectorLabels map[string]string,
 	templateLabels map[string]string,
 	providerSpec *mapiv1beta1.ProviderSpec,
+	replicas int32,
 ) *mapiv1beta1.MachineSet {
 	ms := mapiv1beta1.MachineSet{
 		TypeMeta: metav1.TypeMeta{
@@ -306,7 +308,7 @@ func newMachineSet(
 					ProviderSpec: *providerSpec.DeepCopy(),
 				},
 			},
-			Replicas: pointer.Int32Ptr(0),
+			Replicas: pointer.Int32Ptr(replicas),
 		},
 	}
 
@@ -435,14 +437,15 @@ var _ = g.Describe("FROBWARE[Feature:Machines][Serial] Autoscaler should", func(
 			machineSets[i] = platformMachineSets[i].DeepCopy()
 		}
 
-		// create new machinesets
+		// create new machinesets so that we have 3
 		for i := len(platformMachineSets); i < len(machineSets); i++ {
 			machineSets[i] = newMachineSet(targetMachineSet.Labels[clusterKey],
 				targetMachineSet.Namespace,
 				fmt.Sprintf("autoscaler-%d-%s", i, targetMachineSet.Name),
 				targetMachineSet.Spec.Selector.MatchLabels,
 				targetMachineSet.Spec.Template.ObjectMeta.Labels,
-				&targetMachineSet.Spec.Template.Spec.ProviderSpec)
+				&targetMachineSet.Spec.Template.Spec.ProviderSpec,
+				1) // one replica
 			machineSets[i].Annotations = map[string]string{
 				nodeGroupInstanceCPUCapacity:    cpuCapacity.String(),
 				nodeGroupInstanceMemoryCapacity: memCapacity.String(),
@@ -453,6 +456,23 @@ var _ = g.Describe("FROBWARE[Feature:Machines][Serial] Autoscaler should", func(
 			}
 			o.Expect(client.Create(context.TODO(), machineSets[i])).Should(o.Succeed())
 			cleanupObjects = append(cleanupObjects, runtime.Object(machineSets[i]))
+		}
+
+		if additionalNodes := len(machineSets) - len(platformMachineSets); additionalNodes > 0 {
+			testDuration := time.Now().Add(time.Duration(e2e.WaitLong))
+			o.Eventually(func() bool {
+				g.By(fmt.Sprintf("[%s remaining] Waiting until %v new nodes are Ready",
+					remaining(testDuration), additionalNodes))
+				var allNodes []*corev1.Node
+				for i := len(platformMachineSets); i < len(machineSets); i++ {
+					nodes, err := infra.GetNodesFromMachineSet(client, *machineSets[i])
+					if err != nil {
+						return false
+					}
+					allNodes = append(allNodes, nodes...)
+				}
+				return len(allNodes) == additionalNodes && infra.NodesAreReady(allNodes)
+			}, e2e.WaitLong, pollingInterval).Should(o.BeTrue())
 		}
 
 		g.By(fmt.Sprintf("Creating %v machineautoscalers", len(machineSets)))
@@ -487,7 +507,7 @@ var _ = g.Describe("FROBWARE[Feature:Machines][Serial] Autoscaler should", func(
 			}
 		}).enable()
 
-		g.By(fmt.Sprintf("Creating ClusterAutoscaler configured with maxNodesTotal:%v. There are %v existing nodes", maxNodesTotal, len(nodes)))
+		g.By(fmt.Sprintf("Creating ClusterAutoscaler configured with maxNodesTotal:%v", maxNodesTotal))
 		clusterAutoscaler := clusterAutoscalerResource(maxNodesTotal)
 		o.Expect(client.Create(context.TODO(), clusterAutoscaler)).Should(o.Succeed())
 		cleanupObjects = append(cleanupObjects, runtime.Object(clusterAutoscaler))
